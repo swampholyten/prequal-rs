@@ -1,4 +1,5 @@
 mod config;
+mod metrics;
 
 #[tokio::main]
 async fn main() {
