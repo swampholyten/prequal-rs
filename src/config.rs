@@ -42,7 +42,7 @@ impl Default for PrequalConfig {
 
 impl PrequalConfig {
     /// Eq.: b_reuse = max(1, (1+delta) / ((1 - m/n) * (r_probe - r_remove)))
-    pub fn fn_reuse_budget(&self, n_replicas: usize) -> u32 {
+    pub fn reuse_budget(&self, n_replicas: usize) -> u32 {
         let m = self.pool_capacity as f64;
         let n = n_replicas as f64;
         let net = (1.0 - m / n) * (self.r_probe as f64 - self.r_remove as f64);
