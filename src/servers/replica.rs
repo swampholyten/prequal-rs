@@ -192,7 +192,8 @@ async fn work(
     let rif_at_arrival = state.rif.fetch_add(1, Ordering::SeqCst) + 1;
     let start = Instant::now();
 
-    tokio::task::spawn_blocking(move || spin_hash(req.iterations))
+    let iterations = (req.iterations as f64 * state.work_factor) as u64;
+    tokio::task::spawn_blocking(move || spin_hash(iterations))
         .await
         .expect("worker panicked");
 
@@ -221,6 +222,7 @@ pub async fn run(args: ServerArgs) {
             std::time::Duration::from_millis(500),
         ))),
         cpu: Arc::new(Mutex::new(CpuTracker::new(args.cpu_alloc))),
+        work_factor: args.work_factor,
     };
 
     let cpu = state.cpu.clone();
