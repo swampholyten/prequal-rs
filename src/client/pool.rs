@@ -178,3 +178,113 @@ impl ProbePool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(replica: usize, rif: u32, latency_us: u64) -> Probe {
+        Probe {
+            replica,
+            rif,
+            rif_at_probe: rif,
+            latency_us,
+            received_at: Instant::now(),
+            uses: 0,
+        }
+    }
+
+    fn pool_with(probes: Vec<Probe>, q_rif: f64) -> ProbePool {
+        let mut pool = ProbePool::new(16, Duration::from_secs(10), 100, q_rif);
+        for p in probes {
+            pool.insert(p);
+        }
+        pool
+    }
+
+    #[test]
+    fn hcl_picks_lowest_latency_cold_replica() {
+        // rifs [1,2,3,10], q=0.84 -> threshold = 3rd smallest = 3.
+        // Replica 3 (rif 10) is hot; among cold, replica 1 has lowest latency.
+        let mut pool = pool_with(
+            vec![
+                probe(0, 1, 9_000),
+                probe(1, 2, 4_000),
+                probe(2, 3, 8_000),
+                probe(3, 10, 1_000),
+            ],
+            0.84,
+        );
+        assert_eq!(pool.hcl_select(), Some(1));
+    }
+
+    #[test]
+    fn q_rif_zero_is_rif_only_control() {
+        // threshold = min RIF, so only min-RIF probes are cold; latency of
+        // hotter replicas must not matter.
+        let mut pool = pool_with(
+            vec![probe(0, 3, 1_000), probe(1, 5, 10), probe(2, 7, 10)],
+            0.0,
+        );
+        assert_eq!(pool.hcl_select(), Some(0));
+    }
+
+    #[test]
+    fn q_rif_one_is_latency_only_control() {
+        // threshold = max RIF, everything cold: pure latency choice.
+        let mut pool = pool_with(
+            vec![probe(0, 30, 5_000), probe(1, 1, 9_000), probe(2, 2, 7_000)],
+            1.0,
+        );
+        assert_eq!(pool.hcl_select(), Some(0));
+    }
+
+    #[test]
+    fn selection_compensates_rif_on_all_copies() {
+        let mut pool = pool_with(vec![probe(0, 0, 1_000), probe(0, 0, 2_000)], 0.84);
+        pool.hcl_select();
+        assert!(pool.snapshot(Instant::now()).iter().all(|&(_, rif, _, _)| rif == 1));
+    }
+
+    #[test]
+    fn expire_enforces_reuse_budget() {
+        let mut pool = ProbePool::new(16, Duration::from_secs(10), 2, 0.84);
+        pool.insert(probe(0, 0, 1_000));
+        pool.insert(probe(1, 5, 1_000));
+        pool.hcl_select(); // replica 0, uses -> 1
+        pool.hcl_select(); // replica 0 again (still coldest), uses -> 2
+        pool.expire(Instant::now());
+        assert_eq!(pool.len(), 1); // replica 0's probe hit the budget
+    }
+
+    #[test]
+    fn insert_evicts_oldest_at_capacity() {
+        let mut pool = ProbePool::new(2, Duration::from_secs(10), 100, 0.84);
+        let old = probe(0, 0, 1_000);
+        std::thread::sleep(Duration::from_millis(2));
+        pool.insert(probe(1, 1, 1_000));
+        pool.insert(old); // oldest by received_at even though inserted last
+        std::thread::sleep(Duration::from_millis(2));
+        pool.insert(probe(2, 2, 1_000));
+        let replicas: Vec<usize> = pool.snapshot(Instant::now()).iter().map(|s| s.0).collect();
+        assert_eq!(pool.len(), 2);
+        assert!(!replicas.contains(&0));
+    }
+
+    #[test]
+    fn removal_alternates_oldest_then_worst() {
+        let mut pool = pool_with(
+            vec![probe(0, 1, 1_000), probe(1, 2, 2_000), probe(2, 9, 3_000)],
+            0.84,
+        );
+        // First removal: oldest (replica 0, inserted first).
+        pool.remove_one();
+        let replicas: Vec<usize> = pool.snapshot(Instant::now()).iter().map(|s| s.0).collect();
+        assert!(!replicas.contains(&0));
+        // Second removal: worst. Threshold over [2,9] at q=0.84 is 2, so
+        // replica 2 (rif 9) is hot and must go as highest-RIF.
+        pool.remove_one();
+        let replicas: Vec<usize> = pool.snapshot(Instant::now()).iter().map(|s| s.0).collect();
+        assert!(!replicas.contains(&2));
+    }
+}
