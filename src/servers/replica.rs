@@ -39,6 +39,11 @@ pub struct ServerArgs {
     /// Phase offset of the square wave, so replicas spike at different times.
     #[arg(long, default_value_t = 0)]
     pub antagonist_phase_s: u64,
+
+    /// Multiplier on per-query work; 2.0 makes this a "slow" replica standing
+    /// in for older hardware (§5.2/§5.3 of the paper).
+    #[arg(long, default_value_t = 1.0)]
+    pub work_factor: f64,
 }
 
 #[derive(Clone)]
@@ -46,6 +51,7 @@ struct ServerState {
     rif: Arc<AtomicU32>,
     latency_ring: Arc<Mutex<LatencyRing>>,
     cpu: Arc<Mutex<CpuTracker>>,
+    work_factor: f64,
 }
 
 /// Ring buffer of recently completed queries for probe latency estimation.
