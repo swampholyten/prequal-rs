@@ -1,0 +1,8 @@
+# Runtime-only image for the experiment testbed: the binary is built on the
+# host (or CI runner) and copied in, so containers start in seconds. Build
+# with the release dir as context:
+#   docker build -t prequal-rs:exp -f experiments/Dockerfile.runtime target/release
+FROM debian:trixie-slim
+COPY prequal-rs /usr/local/bin/prequal-rs
+ENV RUST_LOG=info
+ENTRYPOINT ["prequal-rs"]

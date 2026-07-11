@@ -12,6 +12,7 @@ use std::{
     },
     time::Instant,
 };
+use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::{
@@ -24,7 +25,11 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
-    /// CPU allocation for this replica in cores.
+    /// CPU allocation of this replica in cores (the paper's guaranteed
+    /// per-VM allocation). Normalizes reported CPU utilization and bounds
+    /// in-process concurrency: at most round(cpu_alloc) queries execute at
+    /// once, the rest queue. Should match the kernel-enforced limit of the
+    /// container/VM the replica runs in (e.g. docker --cpus).
     #[arg(long, default_value_t = 1.0)]
     pub cpu_alloc: f64,
 
@@ -52,6 +57,30 @@ struct ServerState {
     latency_ring: Arc<Mutex<LatencyRing>>,
     cpu: Arc<Mutex<CpuTracker>>,
     work_factor: f64,
+    /// Worker slots bounding concurrent query execution to the CPU
+    /// allocation; shared with the antagonist so its bursts steal this
+    /// replica's serving capacity specifically.
+    work_slots: Arc<Semaphore>,
+}
+
+/// Decrements RIF on drop, so a query cancelled mid-flight (client timeout
+/// closes the connection and axum drops the handler future) still gets
+/// counted out. Without this, RIF leaks upward forever under overload,
+/// corrupting the primary load signal.
+struct RifGuard(Arc<AtomicU32>);
+
+impl RifGuard {
+    /// Increment and return the RIF including this query.
+    fn arm(rif: &Arc<AtomicU32>) -> (Self, u32) {
+        let at_arrival = rif.fetch_add(1, Ordering::SeqCst) + 1;
+        (Self(rif.clone()), at_arrival)
+    }
+}
+
+impl Drop for RifGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Ring buffer of recently completed queries for probe latency estimation.
@@ -189,16 +218,30 @@ async fn work(
     State(state): State<ServerState>,
     Json(req): Json<WorkRequest>,
 ) -> Json<WorkResponse> {
-    let rif_at_arrival = state.rif.fetch_add(1, Ordering::SeqCst) + 1;
+    // RIF spans arrival to finish, so it counts queued queries too — that is
+    // what makes it the leading indicator the paper wants (§4 "Load signals":
+    // latency "includes the sojourn time in the queue").
+    let (_rif, rif_at_arrival) = RifGuard::arm(&state.rif);
     let start = Instant::now();
 
     let iterations = (req.iterations as f64 * state.work_factor) as u64;
-    tokio::task::spawn_blocking(move || spin_hash(iterations))
+    let permit = state
+        .work_slots
+        .clone()
+        .acquire_owned()
         .await
-        .expect("worker panicked");
+        .expect("semaphore closed");
+    // The permit moves into the closure: even if this handler is cancelled,
+    // the slot is held until the spin actually ends.
+    tokio::task::spawn_blocking(move || {
+        let out = spin_hash(iterations);
+        drop(permit);
+        out
+    })
+    .await
+    .expect("worker panicked");
 
     let duration_us = start.elapsed().as_micros() as u64;
-    state.rif.fetch_sub(1, Ordering::SeqCst);
     state.latency_ring.lock().push(rif_at_arrival, duration_us);
     Json(WorkResponse { duration_us })
 }
@@ -215,6 +258,7 @@ async fn probe(State(state): State<ServerState>) -> Json<ProbeResponse> {
 }
 
 pub async fn run(args: ServerArgs) {
+    let slots = (args.cpu_alloc.round() as usize).max(1);
     let state = ServerState {
         rif: Arc::new(AtomicU32::new(0)),
         latency_ring: Arc::new(Mutex::new(LatencyRing::new(
@@ -223,6 +267,7 @@ pub async fn run(args: ServerArgs) {
         ))),
         cpu: Arc::new(Mutex::new(CpuTracker::new(args.cpu_alloc))),
         work_factor: args.work_factor,
+        work_slots: Arc::new(Semaphore::new(slots)),
     };
 
     let cpu = state.cpu.clone();
@@ -239,6 +284,7 @@ pub async fn run(args: ServerArgs) {
             args.antagonist_cpu,
             args.antagonist_period_s,
             args.antagonist_phase_s,
+            state.work_slots.clone(),
         ));
     }
 

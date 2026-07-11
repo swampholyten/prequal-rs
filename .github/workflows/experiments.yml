@@ -1,0 +1,48 @@
+name: experiments
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths: ["src/**", "experiments/**", "Cargo.*", ".github/workflows/experiments.yml"]
+
+jobs:
+  testbed:
+    runs-on: ubuntu-latest # 4 vCPUs on public repos
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --release
+
+      - name: Build replica image
+        run: docker build -t prequal-rs:exp -f experiments/Dockerfile.runtime target/release
+
+      - name: Run experiment suite
+        # 4 CPU-capped replica containers (0.75 core each) + client on a
+        # 4-vCPU runner; the suite self-calibrates its load levels against
+        # the testbed's measured capacity knee.
+        run: N_REPLICAS=4 REPLICA_CPUS=0.75 experiments/run.sh
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Analyze
+        run: |
+          uv run experiments/analyze.py | tee experiments/results/summary.txt
+          { echo '```'; cat experiments/results/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experiment-results
+          path: |
+            experiments/results/
+            experiments/figures/
+          if-no-files-found: error
