@@ -63,11 +63,7 @@ pub async fn run(args: ClientArgs) {
     };
     let balancers: Vec<Arc<Balancer>> = (0..args.balancers.max(1))
         .map(|_| {
-            Arc::new(Balancer::new(
-                &args.policy,
-                args.servers.clone(),
-                cfg.clone(),
-            ))
+            Arc::new(Balancer::new(&args.policy, args.servers.clone(), cfg))
         })
         .collect();
     for b in &balancers {

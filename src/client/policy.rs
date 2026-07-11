@@ -19,7 +19,7 @@ pub enum Policy {
     /// Classic power-of-d-choices with synchronous probes, choosing by RIF.
     Po2,
     /// CPU-based weighted random: weights refreshed in the background from
-    /// each relica's smoothed CPU utilization (the paper's WRR incumbent).
+    /// each replica's smoothed CPU utilization (the paper's WRR incumbent).
     Wrr {
         weights: Arc<Mutex<Vec<f64>>>,
     },

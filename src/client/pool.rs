@@ -23,7 +23,7 @@ impl Probe {
 
 /// Bounded pool of probe responses with the paper's removal machinery:
 /// TTL expiry, reuse budget, oldest-eviction on overflow, and per-query
-/// removal alternating between olderst and worst.
+/// removal alternating between oldest and worst.
 pub struct ProbePool {
     probes: Vec<Probe>,
     capacity: usize,
