@@ -1,3 +1,6 @@
+//! CPU antagonist: background interference load, spawned by
+//! [`crate::servers::replica::run`] when `--antagonist-cpu > 0`.
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -18,6 +21,11 @@ use tracing::info;
 /// replicas keep their own allocations. A deficit counter keeps the average
 /// burn at the configured rate even when bursts queue behind in-flight
 /// queries.
+///
+/// - `cpu_pct`: burn target in % of one core (clamped to 100).
+/// - `period_s`: square-wave period in seconds; 0 means constant burn.
+/// - `phase_s`: offset of the wave, staggering spikes across replicas.
+/// - `slots`: the replica's worker semaphore the burner competes for.
 pub async fn run(cpu_pct: u8, period_s: u64, phase_s: u64, slots: Arc<Semaphore>) {
     let target_rate = cpu_pct.min(100) as f64 / 100.0;
     info!("antagonist starting: {cpu_pct}% of allocation, period {period_s}s, phase {phase_s}s");

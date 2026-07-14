@@ -1,20 +1,32 @@
+//! Aggregates per-query outcomes into HDR histograms for the run summary.
+
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
 use serde_json::json;
 
+/// Thread-safe collector shared by all query tasks in [`crate::client::run`].
+/// Records one latency sample (or error) per query and renders the summary
+/// printed at the end of the run and in the periodic progress line.
 pub struct MetricsCollector {
     inner: Mutex<Inner>,
 }
 
+/// Mutable state behind the collector's lock.
 struct Inner {
-    histogram: Histogram<u64>, // latency in microseconds
+    /// End-to-end latency (µs) across all replicas.
+    histogram: Histogram<u64>,
+    /// Same latencies split by serving replica, to show load distribution.
     per_replica: Vec<Histogram<u64>>,
+    /// Failed queries: HTTP errors, timeouts, bad response bodies.
     error_count: u64,
+    /// All queries, successful or not.
     query_count: u64,
+    /// Collector creation time, for the elapsed-seconds field.
     window_start: std::time::Instant,
 }
 
 impl MetricsCollector {
+    /// Empty collector with one per-replica histogram per backend.
     pub fn new(n_replicas: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -29,6 +41,8 @@ impl MetricsCollector {
         }
     }
 
+    /// Record a successful query: its end-to-end latency (µs) and which
+    /// replica served it.
     pub fn record(&self, replica: usize, latency_us: u64) {
         let mut inner = self.inner.lock();
         inner.query_count += 1;
@@ -36,12 +50,15 @@ impl MetricsCollector {
         inner.per_replica[replica].record(latency_us).ok();
     }
 
+    /// Record a failed query (timeout, HTTP error, or undecodable body).
     pub fn record_error(&self) {
         let mut inner = self.inner.lock();
         inner.query_count += 1;
         inner.error_count += 1;
     }
 
+    /// JSON summary: policy, offered qps, counts, overall latency
+    /// percentiles (ms), and per-replica query counts and percentiles.
     pub fn summary(&self, policy: &str, qps: f64) -> serde_json::Value {
         let inner = self.inner.lock();
         let h = &inner.histogram;

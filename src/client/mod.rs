@@ -1,3 +1,11 @@
+//! Load-generating client: open-loop Poisson arrivals dispatched to replicas
+//! through a set of independent [`policy::Balancer`] instances.
+//!
+//! [`run`] is the entry point (called from [`crate::main`] for the `client`
+//! subcommand). Per query it picks a balancer at random, asks it to
+//! [`policy::Balancer::select`] a replica, POSTs the work there, and records
+//! the end-to-end latency in a [`MetricsCollector`].
+
 pub mod policy;
 pub mod pool;
 
@@ -9,6 +17,9 @@ use tracing::info;
 
 use crate::{client::policy::Balancer, config::{PrequalConfig, WorkRequest, WorkResponse}, metrics::collector::MetricsCollector};
 
+/// CLI arguments of the `client` subcommand. The Prequal-specific fields
+/// (`r_probe`, `pool_capacity`, `probe_ttl_ms`, `q_rif`) are folded into a
+/// [`PrequalConfig`]; the rest shape the workload.
 #[derive(Args, Debug)]
 pub struct ClientArgs {
     /// Comma-separated replica base URLs, e.g. http://r1:8000,http://r2:8000
@@ -20,6 +31,7 @@ pub struct ClientArgs {
     /// Offered load: open-loop Poisson arrivals per second.
     #[arg(long, default_value_t = 100.0)]
     pub qps: f64,
+    /// Length of the load-generation phase in seconds.
     #[arg(long, default_value_t = 60)]
     pub duration_s: u64,
     /// Mean hash iterations per query; per-query cost is Normal with
@@ -34,14 +46,16 @@ pub struct ClientArgs {
     /// makes every query herd onto the same "best" replica.
     #[arg(long, default_value_t = 6)]
     pub balancers: usize,
+    /// Probes fired asynchronously per query (Prequal r_probe).
     #[arg(long, default_value_t = 3)]
     pub r_probe: usize,
-    /// Paper default is 16 with n=100 replicas; the pool must stay well
-    /// below the replica count so each balancer sees a random subset —
-    /// that is what decorrelates clients and prevents herding. With our
-    /// 6-replica testbed, 4 is the equivalent setting.
+    /// Probe pool capacity. Paper default is 16 with n=100 replicas; the
+    /// pool must stay well below the replica count so each balancer sees a
+    /// random subset — that is what decorrelates clients and prevents
+    /// herding. With our 6-replica testbed, 4 is the equivalent setting.
     #[arg(long, default_value_t = 4)]
     pub pool_capacity: usize,
+    /// Probe lifetime in ms before expiry from the pool.
     #[arg(long, default_value_t = 1000)]
     pub probe_ttl_ms: u64,
     /// Hot/cold RIF quantile; 0 = RIF-only control (§5.2).
@@ -49,6 +63,10 @@ pub struct ClientArgs {
     pub q_rif: f64,
 }
 
+/// Client entry point: builds the balancers, generates Poisson arrivals for
+/// `duration_s` seconds (each query spawned as its own task so slow replicas
+/// never block the arrival process), waits for in-flight queries to drain,
+/// and prints the JSON metrics summary to stdout.
 pub async fn run(args: ClientArgs) {
     assert!(
         args.servers.len() >= 2,
