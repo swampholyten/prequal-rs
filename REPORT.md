@@ -6,8 +6,9 @@ Wydrowski, Kleinberg, Rumble, Archer — NSDI 2024 (`bib/nsdi24-wydrowski.pdf`).
 This document covers: (1) what the paper proposes, (2) how this repo
 implements it, (3) the correctness review — two real bugs found and fixed,
 (4) why the testbed needed per-replica CPU isolation and how the experiments
-are set up, and (5) the results from the CI experiment run and how they
-compare with the paper's findings.
+are set up, (5) the results from the CI experiment run and how they compare
+with the paper's findings, and (6) two questions of our own that the
+reproduction ended up answering.
 
 ---
 
@@ -356,7 +357,65 @@ load with zero errors.
 
 ---
 
-## 6. Reproducing
+## 6. Beyond the paper — two questions of our own
+
+Reproducing the experiments ended up answering two questions the paper does
+not ask. Both started out as problems — one as a confusing sweep result, one
+as a testbed that refused to show any policy differences — and both turned
+out to be findings about *when* Prequal's machinery actually matters. They
+are negative results, but the useful kind: they mark the boundaries of the
+paper's claims.
+
+### 6.1 Does the hot/cold distinction still add value on a small fleet?
+
+The paper tunes `Q_RIF` on a fleet of 100 replicas and finds that a mid-range
+setting beats both endpoints. Our sweep (experiment C) asks the same question
+at the opposite end of the scale: 4 replicas, probe pool of 4.
+
+The answer is no. Every setting that respects RIF at all — from `Q_RIF = 0`
+(RIF-only) up to 0.97 — lands within noise of the others at ~90 % load with
+zero errors; only pure latency control (`Q_RIF = 1`) stands out, and only by
+being worse (p99.9 about 50 % above RIF-only). The reason is structural, not
+statistical bad luck: the hot threshold is a quantile of the RIF distribution
+estimated from the pool, and with at most 4 distinct replicas in the pool
+that distribution has only a handful of possible values. The quantile can
+barely move, so the hot/cold split adds almost no information on top of
+"pick the lowest RIF".
+
+The practical takeaway: on a small fleet, the simplest configuration
+(RIF-only, `Q_RIF = 0`) is all you need — the quantile machinery is a
+large-fleet refinement, not a requirement. And it is safe to leave the
+default in place: mid-range settings don't win here, but they don't lose
+either. The only real mistake at any scale is ignoring RIF completely.
+
+### 6.2 Does Prequal help when replicas share cores without capacity isolation?
+
+The isolation story of section 3.3 was found while debugging, but it answers
+a genuine deployment question: many small setups co-locate all service
+processes on one machine, with no pinned CPU allocations. Does Prequal buy
+anything there?
+
+Again no — and not because of a bug. With replicas running as bare processes
+on shared cores we measured, repeatedly: all policies statistically identical
+below saturation (random included); an antagonist attached to one replica
+slowing down *all* of them, so routing around the "hot" one avoided nothing;
+and non-monotonic collapse above saturation. The explanation is simple: load
+balancing can only help when replicas have *private* capacity, so that one
+can be busy while another has headroom. When every replica draws from the
+same shared cores, the OS scheduler has already smeared the load evenly, and
+RIF and latency look the same everywhere — there is nothing left for the
+balancer to see or to route around.
+
+The takeaway is that the paper's per-VM guaranteed CPU allocation is not a
+testbed detail; it is a load-bearing assumption. Prequal (and by the same
+logic any load-signal-based balancer) needs replicas whose capacity is
+isolated enough that their load signals can actually differ. Deploying it
+over co-located, unisolated processes costs the probing overhead and returns
+nothing.
+
+---
+
+## 7. Reproducing
 
 ```sh
 cargo build --release
