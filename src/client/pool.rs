@@ -1,15 +1,25 @@
+//! The probe pool (§4 of the paper): a small bounded store of probe
+//! responses that decouples probing from query dispatch. Owned by the
+//! `prequal` variant of [`crate::client::policy::Policy`]; probes are
+//! inserted by background probe tasks and consumed by [`ProbePool::hcl_select`]
+//! on the query path.
+
 use std::time::{Duration, Instant};
 
-/// One probe response held in the pool
+/// One probe response held in the pool.
 #[derive(Debug, Clone, Copy)]
 pub struct Probe {
+    /// Index of the probed replica in `Balancer::urls`.
     pub replica: usize,
     /// RIF as reported, plus one per query we dispatched there since.
     pub rif: u32,
     /// RIF as reported by the probe, for latency rescaling.
     pub rif_at_probe: u32,
+    /// Replica's latency estimate (µs) at probe time.
     pub latency_us: u64,
+    /// When the response arrived; drives TTL expiry and oldest-eviction.
     pub received_at: Instant,
+    /// Times this probe won selection; bounded by the reuse budget.
     pub uses: u32,
 }
 
@@ -25,15 +35,22 @@ impl Probe {
 /// TTL expiry, reuse budget, oldest-eviction on overflow, and per-query
 /// removal alternating between oldest and worst.
 pub struct ProbePool {
+    /// Live probes, unordered (removal uses `swap_remove`).
     probes: Vec<Probe>,
+    /// Maximum pool size (`PrequalConfig::pool_capacity`).
     capacity: usize,
+    /// Maximum probe age (`PrequalConfig::probe_ttl_ms`).
     ttl: Duration,
+    /// Maximum uses per probe (`PrequalConfig::reuse_budget`).
     reuse_budget: u32,
+    /// Hot/cold RIF quantile (`PrequalConfig::q_rif`).
     q_rif: f64,
+    /// Alternation state for [`ProbePool::remove_one`].
     remove_oldest_next: bool,
 }
 
 impl ProbePool {
+    /// Empty pool with the given limits; see the field docs for their meaning.
     pub fn new(capacity: usize, ttl: Duration, reuse_budget: u32, q_rif: f64) -> Self {
         Self {
             probes: Vec::with_capacity(capacity),
@@ -45,6 +62,8 @@ impl ProbePool {
         }
     }
 
+    /// Current number of pooled probes; below 2 the balancer falls back to
+    /// uniform random selection.
     pub fn len(&self) -> usize {
         self.probes.len()
     }
@@ -64,6 +83,7 @@ impl ProbePool {
             .collect()
     }
 
+    /// Add a fresh probe, evicting the oldest first if the pool is full.
     pub fn insert(&mut self, probe: Probe) {
         if self.probes.len() >= self.capacity {
             self.remove_oldest();
@@ -105,7 +125,8 @@ impl ProbePool {
     /// Hot-Cold Lexicographic rule: if every probe is hot, take the lowest RIF;
     /// otherwise take the cold probe with the
     /// lowest latency. Bumps the chosen probe's use count and RIF (the
-    /// client compensates for its own query).
+    /// client compensates for its own query). Returns the chosen replica
+    /// index, or None if the pool is empty.
     pub fn hcl_select(&mut self) -> Option<usize> {
         let threshold = self.hot_threshold()?;
         let cold_best = self
@@ -166,6 +187,8 @@ impl ProbePool {
         }
     }
 
+    /// Remove the probe with the earliest `received_at` (overflow eviction
+    /// and the "oldest" half of [`ProbePool::remove_one`]).
     fn remove_oldest(&mut self) {
         if let Some(i) = self
             .probes

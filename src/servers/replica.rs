@@ -1,3 +1,9 @@
+//! Backend replica: an axum server exposing the two endpoints the client
+//! uses — `POST /work` ([`work`], CPU-bound hashing bounded by the CPU
+//! allocation) and `GET /probe` ([`probe`], the load signals RIF, latency
+//! estimate, and CPU utilization). [`run`] is the entry point for the
+//! `server` subcommand.
+
 use axum::{
     Json, Router,
     extract::State,
@@ -20,8 +26,10 @@ use crate::{
     servers::antagonist,
 };
 
+/// CLI arguments of the `server` subcommand.
 #[derive(Args, Debug)]
 pub struct ServerArgs {
+    /// TCP port to listen on (all interfaces).
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
@@ -51,11 +59,17 @@ pub struct ServerArgs {
     pub work_factor: f64,
 }
 
+/// Shared state behind both endpoints, built once in [`run`].
 #[derive(Clone)]
 struct ServerState {
+    /// Requests in flight, incremented on arrival and decremented on
+    /// completion (or cancellation) via [`RifGuard`].
     rif: Arc<AtomicU32>,
+    /// Recent completions used by [`probe`] to estimate latency.
     latency_ring: Arc<Mutex<LatencyRing>>,
+    /// Smoothed CPU utilization, sampled by a background task in [`run`].
     cpu: Arc<Mutex<CpuTracker>>,
+    /// Per-query work multiplier (`--work-factor`).
     work_factor: f64,
     /// Worker slots bounding concurrent query execution to the CPU
     /// allocation; shared with the antagonist so its bursts steal this
@@ -85,31 +99,44 @@ impl Drop for RifGuard {
 
 /// Ring buffer of recently completed queries for probe latency estimation.
 struct LatencyRing {
+    /// Completed-query samples, overwritten circularly once full.
     entries: Vec<RingEntry>,
+    /// Next slot to overwrite when the ring is at capacity.
     head: usize,
+    /// Maximum retained samples.
     capacity: usize,
 
     /// Estimates use only samples this recently. Older samples predate antagonist swings.
     max_age: std::time::Duration,
 }
 
+/// One completed query in the [`LatencyRing`].
 #[derive(Clone, Copy)]
 struct RingEntry {
+    /// RIF at the query's arrival, tagging the occupancy the sample reflects.
     rif_at_arrival: u32,
+    /// Arrival-to-completion wall time (µs).
     duration_us: u64,
+    /// Completion time, for the freshness filter.
     finished_at: Instant,
 }
 
-// Process CPU time (user+sys) via getrusage.
-// Includes the in-process antagonist, like machine CPU utilization in the paper's setting.
+/// Process CPU time (user+sys) via getrusage.
+/// Includes the in-process antagonist, like machine CPU utilization in the paper's setting.
 struct CpuTracker {
+    /// Process CPU time (µs) at the previous sample.
     last_cpu_us: u64,
+    /// Wall clock at the previous sample.
     last_wall: Instant,
+    /// CPU allocation in cores; utilization is reported relative to it.
     alloc: f64,
+    /// Exponential moving average of utilization, served in probes.
     util_ema: f64,
 }
 
 impl LatencyRing {
+    /// Empty ring holding at most `capacity` samples, preferring ones
+    /// younger than `max_age` when estimating.
     fn new(capacity: usize, max_age: std::time::Duration) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -119,6 +146,7 @@ impl LatencyRing {
         }
     }
 
+    /// Record a completed query, overwriting the oldest slot when full.
     fn push(&mut self, rif_at_arrival: u32, duration_us: u64) {
         let entry = RingEntry {
             rif_at_arrival,
@@ -169,6 +197,7 @@ impl LatencyRing {
     }
 }
 
+/// Total process CPU time (user + system, µs) from `getrusage`.
 fn process_cpu_us() -> u64 {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let ru = unsafe {
@@ -180,6 +209,8 @@ fn process_cpu_us() -> u64 {
 }
 
 impl CpuTracker {
+    /// Tracker for a replica allocated `alloc` cores, starting from the
+    /// current process CPU time.
     fn new(alloc: f64) -> Self {
         Self {
             last_cpu_us: process_cpu_us(),
@@ -189,6 +220,8 @@ impl CpuTracker {
         }
     }
 
+    /// Fold the CPU time spent since the last call into the utilization EMA.
+    /// Called every 500ms by the background task in [`run`].
     fn sample(&mut self) {
         let cpu = process_cpu_us();
         let wall = Instant::now();
@@ -214,6 +247,9 @@ fn spin_hash(iterations: u64) -> u64 {
     std::hint::black_box(x)
 }
 
+/// `POST /work` handler: runs the requested iterations (scaled by
+/// `work_factor`) on a blocking thread once a worker slot is free, then
+/// records the completion in the latency ring and returns the duration.
 async fn work(
     State(state): State<ServerState>,
     Json(req): Json<WorkRequest>,
@@ -246,6 +282,8 @@ async fn work(
     Json(WorkResponse { duration_us })
 }
 
+/// `GET /probe` handler: reports the three load signals — current RIF, the
+/// RIF-indexed latency estimate, and smoothed CPU utilization.
 async fn probe(State(state): State<ServerState>) -> Json<ProbeResponse> {
     let rif = state.rif.load(Ordering::SeqCst);
     let latency_us = state.latency_ring.lock().median_near(rif, Instant::now());
@@ -257,6 +295,9 @@ async fn probe(State(state): State<ServerState>) -> Json<ProbeResponse> {
     })
 }
 
+/// Replica entry point: builds the shared state, spawns the CPU sampler and
+/// (if configured) the antagonist, and serves `/work` and `/probe` until
+/// killed.
 pub async fn run(args: ServerArgs) {
     let slots = (args.cpu_alloc.round() as usize).max(1);
     let state = ServerState {

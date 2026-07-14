@@ -1,3 +1,7 @@
+//! Replica-selection policies. A [`Balancer`] wraps one [`Policy`] plus the
+//! shared HTTP client; [`crate::client::run`] creates several independent
+//! balancers and calls [`Balancer::select`] once per query.
+
 use std::sync::atomic::Ordering;
 use std::{
     sync::{Arc, atomic::AtomicUsize},
@@ -13,30 +17,47 @@ use crate::{
     config::{PrequalConfig, ProbeResponse},
 };
 
+/// A balancing policy and its per-instance state. Selected by name in
+/// [`Balancer::new`] from the `--policy` flag.
 pub enum Policy {
+    /// Uniform random choice; the no-signal baseline.
     Random,
+    /// Cycles through replicas; the counter is the next index.
     RoundRobin(AtomicUsize),
     /// Classic power-of-d-choices with synchronous probes, choosing by RIF.
     Po2,
     /// CPU-based weighted random: weights refreshed in the background from
     /// each replica's smoothed CPU utilization (the paper's WRR incumbent).
     Wrr {
+        /// Per-replica weight 1/cpu_util, refreshed once per second.
         weights: Arc<Mutex<Vec<f64>>>,
     },
+    /// The paper's policy: async probes pooled and ranked by the HCL rule.
     Prequal {
+        /// Shared probe pool; probe tasks insert, [`Balancer::select`] consumes.
         pool: Arc<Mutex<ProbePool>>,
+        /// Tuning parameters (probe rate, removals, quantile).
         cfg: PrequalConfig,
     },
 }
 
+/// One independent load-balancer instance: a policy, the replica URL list,
+/// and the HTTP client used for probes and (by the caller) for queries.
 pub struct Balancer {
+    /// The selection policy and its state.
     pub policy: Policy,
+    /// Replica base URLs; `select` returns an index into this list.
     pub urls: Arc<Vec<String>>,
+    /// Shared connection pool for probes and work requests.
     pub http: reqwest::Client,
+    /// Timeout for a single probe; failed probes are silently dropped.
     pub probe_timeout: Duration,
 }
 
 impl Balancer {
+    /// Builds the balancer for `policy_name` (`random`, `round-robin`,
+    /// `po2`, `wrr`, `prequal`), sizing the Prequal probe pool from `cfg`
+    /// and the replica count. Panics on an unknown name.
     pub fn new(policy_name: &str, urls: Vec<String>, cfg: PrequalConfig) -> Self {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(256)
@@ -69,7 +90,7 @@ impl Balancer {
         }
     }
 
-    /// Debug: dump pool contents periodically.
+    /// Debug: dump pool contents every 250ms (enabled via `DEBUG_POOL`).
     pub fn start_pool_dump(&self) {
         if let Policy::Prequal { pool, .. } = &self.policy {
             let pool = pool.clone();
@@ -91,6 +112,7 @@ impl Balancer {
     }
 
     /// Spawn background machinery a policy needs (WRR weight refresher).
+    /// Called once per balancer by [`crate::client::run`].
     pub fn start(&self) {
         if let Policy::Wrr { weights } = &self.policy {
             let weights = weights.clone();
@@ -111,7 +133,10 @@ impl Balancer {
         }
     }
 
-    /// Pick a replica index for the next query.
+    /// Pick a replica index for the next query. For Prequal this is one
+    /// full round of the algorithm: fire `r_probe` async probes, expire
+    /// stale pool entries, HCL-select (uniform random if fewer than two
+    /// probes remain, §4), then apply the `r_remove` per-query removals.
     pub async fn select(&self) -> usize {
         let n = self.urls.len();
         match &self.policy {
@@ -203,6 +228,8 @@ impl Balancer {
     }
 }
 
+/// GET `{url}/probe` with a timeout; None on any failure, so lost probes
+/// simply never enter the pool.
 async fn fetch_probe(
     http: &reqwest::Client,
     url: &str,

@@ -20,3 +20,13 @@ The **HCL (Hot-Cold Lexicographic) rule** then picks:
 
 Probing is **asynchronous**: probe responses are stored in a bounded pool and reused
 across queries, taking probing off the critical serving path.
+
+## Documentation
+
+Every module, function, and parameter is documented with rustdoc, including the
+crate-level overview of the entry point and query flow. Build and open the API
+documentation page with:
+
+```sh
+cargo doc --no-deps --document-private-items --open
+```
